@@ -3,10 +3,12 @@ name: Update SmartDNS Adblock
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # 2AM UTC hàng ngày
+    - cron: '0 0 * * *'  # Run daily at 0AM UTC
   workflow_dispatch:  # Manual trigger
   push:
     branches: [ main ]
+    paths:
+      - 'generate_adblock.py'  # Only run when script changes
 
 permissions:
   contents: write
@@ -23,25 +25,25 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          # Remove cache: 'pip' since we don't have requirements.txt
       
       - name: Generate blocklist
         run: |
           python generate_adblock.py
-          echo "=== File stats ==="
-          wc -l adblock_merged.txt
-          ls -lh adblock_merged.txt
+          echo "=== File statistics ==="
+          echo "Rules: $(wc -l < adblock_merged.txt)"
+          echo "Size: $(ls -lh adblock_merged.txt | awk '{print $5}')"
       
       - name: Verify output
         run: |
           lines=$(wc -l < adblock_merged.txt)
-          if [ $lines -lt 1000 ]; then
-            echo "ERROR: Too few domains ($lines). Something went wrong!"
+          if [ "$lines" -lt 1000 ]; then
+            echo "❌ ERROR: Too few domains ($lines). Something went wrong!"
             exit 1
           fi
-          echo "✓ Valid output: $lines domains"
+          echo "✅ Valid output: $lines domains"
       
-      - name: Commit and push
+      - name: Commit and push changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -49,7 +51,9 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "🔄 Update adblock list [$(date +%Y-%m-%d)]"
+            timestamp=$(date +%Y-%m-%d)
+            rules=$(wc -l < adblock_merged.txt)
+            git commit -m "🔄 Update adblock list [${timestamp}] - ${rules} rules"
             git push
           fi
       
