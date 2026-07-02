@@ -1,0 +1,66 @@
+# .github/workflows/update-adblock.yml
+name: Update SmartDNS Adblock
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 2AM UTC hàng ngày
+  workflow_dispatch:  # Manual trigger
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  update-blocklist:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Generate blocklist
+        run: |
+          python generate_adblock.py
+          echo "=== File stats ==="
+          wc -l adblock_merged.txt
+          ls -lh adblock_merged.txt
+      
+      - name: Verify output
+        run: |
+          lines=$(wc -l < adblock_merged.txt)
+          if [ $lines -lt 1000 ]; then
+            echo "ERROR: Too few domains ($lines). Something went wrong!"
+            exit 1
+          fi
+          echo "✓ Valid output: $lines domains"
+      
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add adblock_merged.txt
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "🔄 Update adblock list [$(date +%Y-%m-%d)]"
+            git push
+          fi
+      
+      - name: Create Release (optional)
+        if: github.event_name == 'schedule'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          files: adblock_merged.txt
+          body: |
+            ## Auto-generated SmartDNS Blocklist
+            - Date: $(date +%Y-%m-%d)
+            - Rules: $(wc -l < adblock_merged.txt)
+          replace: true
