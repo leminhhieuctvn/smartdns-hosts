@@ -9,6 +9,7 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
+from functools import lru_cache
 
 SOURCES = [
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt",
@@ -23,28 +24,43 @@ SOURCES = [
 ]
 
 OUTPUT_FILE = "adblock_merged.txt"
-MAX_WORKERS = 8
-TIMEOUT = 25
-RETRIES = 2
+MAX_WORKERS = 16  # Tăng workers vì phần lớn thời gian là I/O
+TIMEOUT = 15  # Giảm timeout
+RETRIES = 1  # Giảm retries
 
 ALLOWLIST = {
-    "imoulife.com", "*.imoulife.com",
-    "lechange.com", "*.lechange.com",
-    "easy4ip.com", "*.easy4ip.com",
-    "dahuasecurity.com", "*.dahuasecurity.com",
-    "tailscale.com", "*.tailscale.com",
-    "cloudflare-dns.com",
-    "dns.google",
+    "imoulife.com", "lechange.com", "easy4ip.com", 
+    "dahuasecurity.com", "tailscale.com",
+    "cloudflare-dns.com", "dns.google",
 }
 
+# Pre-compile patterns và tối ưu regex
 DOMAIN_RE = re.compile(
     r"^(?:\*\.)?(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
 )
+
+# Cache cho allowlist checking
+@lru_cache(maxsize=10000)
+def is_allowlisted_cached(domain):
+    base = domain[2:] if domain.startswith("*.") else domain
+    
+    # Tối ưu: kiểm tra trực tiếp trước
+    if domain in ALLOWLIST or base in ALLOWLIST:
+        return True
+    
+    for allow in ALLOWLIST:
+        if allow.startswith("*."):
+            allow_base = allow[2:]
+            if base == allow_base or base.endswith("." + allow_base):
+                return True
+    
+    return False
 
 def log(msg):
     print(msg, flush=True)
 
 def is_ip(s):
+    # Tối ưu: kiểm tra nhanh hơn
     try:
         ipaddress.ip_address(s)
         return True
@@ -52,22 +68,41 @@ def is_ip(s):
         return False
 
 def normalize_domain(d):
-    d = d.strip().lower().rstrip(".").replace("\r", "")
+    # Tối ưu: xử lý nhanh hơn với string operations
+    d = d.strip().lower()
+    if not d:
+        return None
+    
+    # Remove trailing dot và carriage return
+    if d.endswith('.'):
+        d = d[:-1]
+    d = d.replace('\r', '').replace('\n', '')
+    
     if not d:
         return None
 
     if d.startswith("."):
         d = "*" + d
 
-    d = d.replace("*.*.", "*.")
+    # Fix double wildcard pattern
+    if "*.*." in d:
+        d = d.replace("*.*.", "*.", 1)
 
+    # Tối ưu: kiểm tra pattern sớm
     if d.startswith("*."):
         base = d[2:]
-        if is_ip(base) or not DOMAIN_RE.match(d):
+        # Fast check cho IP
+        if ':' in base or (base.replace('.', '').isdigit() and base.count('.') == 3):
+            return None
+        if not DOMAIN_RE.match(d):
             return None
         return d
 
-    if "*" in d or is_ip(d):
+    # Nếu có * hoặc là IP, bỏ qua
+    if '*' in d:
+        return None
+    
+    if ':' in d or (d.replace('.', '').isdigit() and d.count('.') == 3):
         return None
 
     if not DOMAIN_RE.match(d):
@@ -77,67 +112,77 @@ def normalize_domain(d):
 
 def extract_from_line(line):
     raw = line.strip().lower()
-    if not raw or raw.startswith(("#", "!", "//", ";", "[")):
+    if not raw or raw[0] in ('#', '!', '/', ';', '['):
         return None
 
-    raw = raw.split("#", 1)[0].split(";", 1)[0].strip()
-    if not raw:
-        return None
+    # Tối ưu: xử lý comment nhanh hơn
+    comment_pos = raw.find('#')
+    if comment_pos == -1:
+        comment_pos = len(raw)
+    comment_pos2 = raw.find(';')
+    if comment_pos2 != -1 and comment_pos2 < comment_pos:
+        comment_pos = comment_pos2
+    
+    if comment_pos != len(raw):
+        raw = raw[:comment_pos].strip()
+        if not raw:
+            return None
 
-    parts = raw.split()
-
-    # hosts format:
-    # 0.0.0.0 domain.com
-    # 127.0.0.1 domain.com
-    if len(parts) >= 2 and is_ip(parts[0]):
-        return normalize_domain(parts[1])
-
-    # AdGuard / ABP:
-    # ||domain.com^
+    # Tối ưu: Kiểm tra các format phổ biến
     if raw.startswith("||"):
         d = raw[2:]
-        d = re.split(r"[\^/$]", d, 1)[0]
-        return normalize_domain(d)
+        end = d.find('^')
+        if end == -1:
+            end = len(d)
+        end2 = d.find('$')
+        if end2 != -1 and end2 < end:
+            end = end2
+        end3 = d.find('/')
+        if end3 != -1 and end3 < end:
+            end = end3
+        return normalize_domain(d[:end])
 
-    # dnsmasq:
-    # address=/domain.com/0.0.0.0
-    # server=/domain.com/
-    m = re.match(r"^(?:address|server)=/([^/]+)/", raw)
-    if m:
-        return normalize_domain(m.group(1))
+    # Hosts format
+    parts = raw.split(None, 2)
+    if len(parts) >= 2:
+        first = parts[0]
+        # Check if first part is IP
+        if first.count('.') == 3 and all(p.isdigit() for p in first.split('.')):
+            return normalize_domain(parts[1])
+        if first == '127.0.0.1':
+            return normalize_domain(parts[1])
 
-    # smartdns:
-    # address /domain.com/#
-    m = re.match(r"^address\s+/([^/]+)/", raw)
-    if m:
-        return normalize_domain(m.group(1))
+    # dnsmasq format
+    if raw.startswith('address=/') or raw.startswith('server=/'):
+        m = re.match(r"^(?:address|server)=/([^/]+)/", raw)
+        if m:
+            return normalize_domain(m.group(1))
 
-    # plain domain / wildcard:
-    # example.com
-    # *.example.com
-    token = re.split(r"[\s,\t]", raw, 1)[0]
-    token = token.split("^", 1)[0]
-    token = token.split("$", 1)[0]
-    token = token.strip()
+    # smartdns format
+    if raw.startswith('address /'):
+        m = re.match(r"^address\s+/([^/]+)/", raw)
+        if m:
+            return normalize_domain(m.group(1))
 
-    return normalize_domain(token)
-
-def is_allowlisted(domain):
-    base = domain[2:] if domain.startswith("*.") else domain
-
-    for allow in ALLOWLIST:
-        allow_base = allow[2:] if allow.startswith("*.") else allow
-        if base == allow_base or base.endswith("." + allow_base):
-            return True
-
-    return False
+    # Plain domain - chỉ lấy token đầu tiên
+    space_pos = raw.find(' ')
+    if space_pos != -1:
+        raw = raw[:space_pos]
+    
+    tab_pos = raw.find('\t')
+    if tab_pos != -1:
+        raw = raw[:tab_pos]
+    
+    # Remove AdGuard modifiers
+    raw = raw.rstrip('^$')
+    
+    return normalize_domain(raw)
 
 def download_one(url):
     name = os.path.basename(urlparse(url).path) or urlparse(url).netloc
     ctx = ssl.create_default_context()
-    last_error = None
-
-    for attempt in range(1, RETRIES + 1):
+    
+    for attempt in range(RETRIES + 1):
         try:
             req = urllib.request.Request(
                 url,
@@ -145,6 +190,7 @@ def download_one(url):
                     "User-Agent": "smartdns-blocklist-generator/3.1",
                     "Accept-Encoding": "gzip",
                     "Connection": "close",
+                    "Cache-Control": "no-cache",
                 },
             )
             with urllib.request.urlopen(req, timeout=TIMEOUT, context=ctx) as r:
@@ -155,78 +201,86 @@ def download_one(url):
                 return name, url, text, None
 
         except Exception as e:
-            last_error = e
-            time.sleep(1)
+            if attempt == RETRIES:
+                return name, url, "", str(e)
+            time.sleep(0.5)  # Giảm delay
 
-    return name, url, "", str(last_error)
+    return name, url, "", "Max retries exceeded"
 
 def parse_content(text):
     domains = set()
-
+    
+    # Tối ưu: xử lý từng dòng một cách hiệu quả
     for line in text.splitlines():
         d = extract_from_line(line)
-        if d and not is_allowlisted(d):
+        if d and not is_allowlisted_cached(d):
             domains.add(d)
-
+    
     return domains
 
-def wildcard_covers_exact(wildcard, exact):
-    if not wildcard.startswith("*."):
-        return False
-
-    base = wildcard[2:]
-    return exact.endswith("." + base)
-
-def wildcard_covers_wildcard(parent, child):
-    if not parent.startswith("*.") or not child.startswith("*."):
-        return False
-
-    parent_base = parent[2:]
-    child_base = child[2:]
-
-    return child_base.endswith("." + parent_base)
-
 def optimize(domains):
-    wildcards = sorted(d for d in domains if d.startswith("*."))
-    exacts = sorted(d for d in domains if not d.startswith("*."))
-
-    # Giữ wildcard cấp cao nếu upstream đã có sẵn.
-    # Không tự tạo wildcard mới.
+    # Phân loại nhanh
+    wildcards = []
+    exacts = []
+    
+    for d in domains:
+        if d.startswith("*."):
+            wildcards.append(d)
+        else:
+            exacts.append(d)
+    
+    # Sắp xếp wildcards theo độ dài (ngắn nhất trước = domain cha)
+    wildcards.sort(key=lambda x: (x.count("."), len(x)))
+    
+    # Loại bỏ wildcards bị bao phủ
     kept_wildcards = []
-    for w in sorted(wildcards, key=lambda x: (x.count("."), x)):
-        if any(wildcard_covers_wildcard(parent, w) for parent in kept_wildcards):
-            continue
-        kept_wildcards.append(w)
-
-    # Bỏ exact nếu đã bị wildcard upstream bao phủ.
+    wildcard_bases = set()
+    
+    for w in wildcards:
+        base = w[2:]  # Bỏ "*."
+        if not any(base.endswith("." + parent_base) for parent_base in wildcard_bases):
+            kept_wildcards.append(w)
+            wildcard_bases.add(base)
+    
+    # Kiểm tra exact domains bị wildcards bao phủ
     kept_exacts = []
     for d in exacts:
-        if any(wildcard_covers_exact(w, d) for w in kept_wildcards):
-            continue
-        kept_exacts.append(d)
-
+        # Kiểm tra nhanh xem có bị wildcard nào bao phủ không
+        covered = False
+        for w_base in wildcard_bases:
+            if d.endswith("." + w_base):
+                covered = True
+                break
+        if not covered:
+            kept_exacts.append(d)
+    
     return kept_wildcards, kept_exacts
 
 def write_output(wildcards, exacts, raw_count, duration):
     final_count = len(wildcards) + len(exacts)
-
+    
+    # Tối ưu: ghi file nhanh hơn với join
     with open(OUTPUT_FILE, "w", encoding="utf-8", newline="\n") as f:
-        f.write("# SmartDNS optimized blocklist\n")
-        f.write(f"# Generated: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n")
-        f.write("# Format: domain-set file, one domain per line\n")
-        f.write("# Rule: keep upstream wildcard/suffix only, do not synthesize new suffix\n")
-        f.write(f"# Raw unique: {raw_count:,}\n")
-        f.write(f"# Final: {final_count:,}\n")
-        f.write(f"# Wildcards: {len(wildcards):,}\n")
-        f.write(f"# Exact: {len(exacts):,}\n")
-        f.write(f"# Duration: {duration:.1f}s\n")
-        f.write("#" + "=" * 60 + "\n\n")
-
-        for d in wildcards:
-            f.write(d + "\n")
-
-        for d in exacts:
-            f.write(d + "\n")
+        lines = [
+            "# SmartDNS optimized blocklist",
+            f"# Generated: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
+            "# Format: domain-set file, one domain per line",
+            "# Rule: keep upstream wildcard/suffix only, do not synthesize new suffix",
+            f"# Raw unique: {raw_count:,}",
+            f"# Final: {final_count:,}",
+            f"# Wildcards: {len(wildcards):,}",
+            f"# Exact: {len(exacts):,}",
+            f"# Duration: {duration:.1f}s",
+            "#" + "=" * 60,
+            "",
+        ]
+        f.write("\n".join(lines))
+        
+        # Ghi domains
+        if wildcards:
+            f.write("\n".join(wildcards) + "\n")
+        if exacts:
+            f.write("\n".join(exacts) + "\n")
 
 def main():
     start = time.time()
@@ -237,8 +291,9 @@ def main():
     log(f"Workers: {MAX_WORKERS}, timeout: {TIMEOUT}s, retries: {RETRIES}")
     log("")
 
+    # Download và parse song song
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(download_one, url) for url in SOURCES]
+        futures = {executor.submit(download_one, url): url for url in SOURCES}
 
         for future in as_completed(futures):
             name, url, text, error = future.result()
