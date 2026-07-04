@@ -30,6 +30,8 @@ SOURCES = [
 ]
 
 OUTPUT_FILE = "adblock_merged.txt"
+META_FILE = OUTPUT_FILE + ".meta"
+DOMAIN_SET_NAME = "adblock"
 MAX_WORKERS = 8
 TIMEOUT = 30
 RETRIES = 3
@@ -41,7 +43,10 @@ ALLOWLIST = {
 }
 
 DOMAIN_RE = re.compile(
-    r"^(?:\*\.)?(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
+    r"^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
+)
+SMARTDNS_DOMAIN_RE = re.compile(
+    r"^(?:\*\.|-\.)?(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
 )
 
 def log(msg):
@@ -76,7 +81,7 @@ def normalize_domain(d):
         base = d[2:]
         if ':' in base or (base.replace('.', '').isdigit() and base.count('.') == 3):
             return None
-        if not DOMAIN_RE.match(d):
+        if not DOMAIN_RE.match(base):
             return None
         return d
 
@@ -204,71 +209,25 @@ def parse_content(text):
     return domains
 
 class DomainTrie:
-    """Trie structure để tối ưu domains"""
+    """Trie đảo ngược để kiểm tra wildcard cha/con nhanh."""
     def __init__(self):
         self.children = {}
         self.is_wildcard = False
-        self.has_wildcard_child = False
-    
-    def insert_reversed(self, domain_parts):
-        """Chèn domain với các phần đảo ngược (com -> example -> sub)"""
-        node = self
-        for part in reversed(domain_parts):
-            if part not in node.children:
-                node.children[part] = DomainTrie()
-            node = node.children[part]
-    
+
     def mark_wildcard(self, domain_parts):
-        """Đánh dấu wildcard tại vị trí cụ thể"""
+        """Đánh dấu wildcard cho một suffix, ví dụ example.com."""
         node = self
         for part in reversed(domain_parts):
-            if part not in node.children:
-                node.children[part] = DomainTrie()
-            node = node.children[part]
+            node = node.children.setdefault(part, DomainTrie())
         node.is_wildcard = True
-    
-    def propagate_wildcards(self):
-        """Lan truyền trạng thái wildcard lên cây"""
-        if self.is_wildcard:
-            self.has_wildcard_child = True
-        
-        for child in self.children.values():
-            child.propagate_wildcards()
-            if child.has_wildcard_child:
-                self.has_wildcard_child = True
-    
-    def get_minimal_suffixes(self, current_path=None):
-        """Lấy các suffix rules tối thiểu"""
-        if current_path is None:
-            current_path = []
-        
-        suffixes = []
-        
-        # Nếu node này là wildcard và không có wildcard cha
-        if self.is_wildcard:
-            # Kiểm tra ancestors
-            if not self._has_wildcard_ancestor(current_path):
-                suffixes.append(".".join(reversed(current_path)))
-        
-        # Duyệt các children có chứa wildcard
-        for part, child in self.children.items():
-            if child.has_wildcard_child:
-                suffixes.extend(child.get_minimal_suffixes(current_path + [part]))
-        
-        return suffixes
-    
-    def _has_wildcard_ancestor(self, path):
-        """Kiểm tra xem có wildcard ancestor không"""
-        node = self
-        for part in reversed(path):
-            if part in node.children:
-                node = node.children[part]
-                if node.is_wildcard and node != self:
-                    return True
-        return False
-    
-    def is_covered_by_suffix(self, domain_parts):
-        """Kiểm tra domain có bị suffix nào bao phủ không"""
+
+    def has_covering_wildcard(self, domain_parts, include_self=True):
+        """Kiểm tra domain có wildcard cha bao phủ không.
+
+        SmartDNS 46.1+ hiểu `*.example.com` là chỉ match subdomain,
+        không match chính `example.com`. Vì vậy exact `example.com` không
+        bị xóa bởi wildcard `*.example.com` khi include_self=False.
+        """
         node = self
         for part in reversed(domain_parts):
             if node.is_wildcard:
@@ -276,79 +235,84 @@ class DomainTrie:
             if part not in node.children:
                 return False
             node = node.children[part]
-        return node.is_wildcard
+        return include_self and node.is_wildcard
 
 def optimize_domains(domains):
-    """Tối ưu domains cho SmartDNS"""
+    """Tối ưu domains cho SmartDNS domain-set list format."""
     log("  Phân loại domains...")
-    
-    wildcards = []
+
+    wildcard_bases = []
     exacts = []
-    
+
     for d in domains:
         if d.startswith("*."):
-            wildcards.append(d[2:])  # Bỏ prefix *.
+            wildcard_bases.append(d[2:])
         else:
             exacts.append(d)
-    
-    log(f"  Wildcards: {len(wildcards):,}, Exacts: {len(exacts):,}")
-    
-    # Xây dựng Trie cho wildcards
-    log("  Tối ưu suffix rules...")
+
+    log(f"  Wildcards: {len(wildcard_bases):,}, Exacts: {len(exacts):,}")
+
+    # Tối ưu wildcard: nếu đã có *.example.com thì bỏ *.a.example.com.
+    log("  Tối ưu wildcard rules...")
     trie = DomainTrie()
-    
-    for w in wildcards:
-        parts = w.split(".")
+    minimal_wildcards = []
+
+    for base in sorted(set(wildcard_bases), key=lambda x: (x.count('.'), x)):
+        parts = base.split(".")
+        if trie.has_covering_wildcard(parts, include_self=True):
+            continue
         trie.mark_wildcard(parts)
-    
-    trie.propagate_wildcards()
-    minimal_suffixes = trie.get_minimal_suffixes()
-    
-    log(f"  Suffix rules: {len(minimal_suffixes):,} (removed {len(wildcards) - len(minimal_suffixes):,} redundant)")
-    
-    # Tối ưu exact domains
+        minimal_wildcards.append(base)
+
+    log(
+        f"  Wildcard rules: {len(minimal_wildcards):,} "
+        f"(removed {len(set(wildcard_bases)) - len(minimal_wildcards):,} redundant)"
+    )
+
+    # Tối ưu exact: chỉ bỏ exact subdomain nếu có wildcard cha.
+    # Không bỏ chính example.com khi có *.example.com vì SmartDNS chỉ match subdomain.
     log("  Tối ưu exact domains...")
     kept_exacts = []
     removed = 0
-    
-    for i, d in enumerate(exacts):
-        if i % 100000 == 0:
-            log(f"    Processing {i:,}/{len(exacts):,}...")
-        
-        parts = d.split(".")
-        if not trie.is_covered_by_suffix(parts):
-            kept_exacts.append(d)
-        else:
-            removed += 1
-    
-    log(f"  Exact domains: {len(kept_exacts):,} (removed {removed:,})")
-    
-    return sorted(minimal_suffixes), sorted(kept_exacts)
 
-def write_smartdns_output(suffixes, exacts, raw_count, duration):
-    """Ghi file blocklist format cho SmartDNS"""
-    final_count = len(suffixes) + len(exacts)
-    
+    for i, d in enumerate(sorted(set(exacts))):
+        if i % 100000 == 0:
+            log(f"    Processing {i:,}/{len(set(exacts)):,}...")
+
+        parts = d.split(".")
+        if trie.has_covering_wildcard(parts, include_self=False):
+            removed += 1
+        else:
+            kept_exacts.append(d)
+
+    log(f"  Exact domains: {len(kept_exacts):,} (removed {removed:,})")
+
+    # SmartDNS domain-set file: mỗi dòng là pattern domain hợp lệ.
+    # `*.example.com` = chỉ subdomain; `example.com` = chính domain.
+    smartdns_rules = [f"*.{base}" for base in minimal_wildcards] + kept_exacts
+    smartdns_rules = [r for r in smartdns_rules if SMARTDNS_DOMAIN_RE.match(r)]
+
+    return sorted(smartdns_rules), len(minimal_wildcards), len(kept_exacts)
+
+def write_smartdns_output(rules, wildcard_count, exact_count, raw_count, duration):
+    """Ghi file domain-set đúng cú pháp SmartDNS 46.1+."""
+    final_count = len(rules)
+
+    # File domain-set nên là danh sách domain/pattern thuần, mỗi dòng một rule.
+    # Tránh ghi `suffix:`/`domain:` vì đó không phải cú pháp domain-set của SmartDNS.
     with open(OUTPUT_FILE, "w", encoding="utf-8", newline="\n") as f:
-        f.write("# SmartDNS Blocklist\n")
+        for rule in rules:
+            f.write(rule + "\n")
+
+    # Metadata tách riêng để file chính luôn sạch và dễ nạp vào SmartDNS.
+    with open(META_FILE, "w", encoding="utf-8", newline="\n") as f:
+        f.write("# SmartDNS Blocklist metadata\n")
         f.write(f"# Generated: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n")
         f.write(f"# Raw unique: {raw_count:,}\n")
         f.write(f"# Final rules: {final_count:,}\n")
-        f.write(f"# Suffix: {len(suffixes):,}\n")
-        f.write(f"# Exact: {len(exacts):,}\n")
+        f.write(f"# Wildcard: {wildcard_count:,}\n")
+        f.write(f"# Exact: {exact_count:,}\n")
         f.write(f"# Duration: {duration:.1f}s\n")
-        f.write("#" + "=" * 60 + "\n\n")
-        
-        if suffixes:
-            f.write("# Suffix rules (match domain and all subdomains)\n")
-            for suffix in suffixes:
-                f.write(f"suffix:{suffix}\n")
-            f.write("\n")
-        
-        if exacts:
-            f.write("# Exact domain rules\n")
-            for domain in exacts:
-                f.write(f"domain:{domain}\n")
 
 def main():
     start = time.time()
@@ -396,28 +360,32 @@ def main():
     
     # Tối ưu
     log("Optimizing...")
-    suffixes, exacts = optimize_domains(all_domains)
+    rules, wildcard_count, exact_count = optimize_domains(all_domains)
 
     duration = time.time() - start
     
     # Ghi output
-    write_smartdns_output(suffixes, exacts, raw_count, duration)
+    write_smartdns_output(rules, wildcard_count, exact_count, raw_count, duration)
 
-    final_count = len(suffixes) + len(exacts)
+    final_count = len(rules)
 
     log("")
     log("=== Results ===")
     log(f"Raw unique : {raw_count:,}")
     log(f"Final rules: {final_count:,}")
-    log(f"  Suffix   : {len(suffixes):,}")
-    log(f"  Exact    : {len(exacts):,}")
+    log(f"  Wildcard : {wildcard_count:,}")
+    log(f"  Exact    : {exact_count:,}")
     log(f"Saved      : {raw_count - final_count:,}")
     log(f"Duration   : {duration:.1f}s")
     log(f"Output     : {OUTPUT_FILE}")
+    log(f"Meta       : {META_FILE}")
     log(f"Size       : {os.path.getsize(OUTPUT_FILE) / 1024:.1f} KiB")
     
-    log("\nUsage in SmartDNS:")
-    log(f"  conf-file {os.path.abspath(OUTPUT_FILE)}")
+    abs_output = os.path.abspath(OUTPUT_FILE)
+    log("\nUsage in SmartDNS 46.1+:")
+    log(f"  domain-set -name {DOMAIN_SET_NAME} -type list -file {abs_output}")
+    log(f"  domain-rules /domain-set:{DOMAIN_SET_NAME}/ -address #")
+    log("  # hoặc: address /domain-set:{}/#".format(DOMAIN_SET_NAME))
 
 if __name__ == "__main__":
     main()
