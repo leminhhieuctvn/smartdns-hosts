@@ -14,7 +14,7 @@ SOURCES = [
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/fake-onlydomains.txt",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/popupads-onlydomains.txt",
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/tif-onlydomains.txt",
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/tif.medium-onlydomains.txt",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/doh-vpn-proxy-bypass-onlydomains.txt",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/dyndns-onlydomains.txt",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/gambling-onlydomains.txt",
@@ -52,12 +52,14 @@ def is_ip(s):
         return False
 
 def normalize_domain(d):
-    d = d.strip().lower().rstrip(".")
+    d = d.strip().lower().rstrip(".").replace("\r", "")
     if not d:
         return None
 
     if d.startswith("."):
         d = "*" + d
+
+    d = d.replace("*.*.", "*.")
 
     if d.startswith("*."):
         base = d[2:]
@@ -84,28 +86,40 @@ def extract_from_line(line):
 
     parts = raw.split()
 
-    # hosts format: 0.0.0.0 domain.com / 127.0.0.1 domain.com
+    # hosts format:
+    # 0.0.0.0 domain.com
+    # 127.0.0.1 domain.com
     if len(parts) >= 2 and is_ip(parts[0]):
         return normalize_domain(parts[1])
 
-    # AdGuard/ABP: ||domain.com^
+    # AdGuard / ABP:
+    # ||domain.com^
     if raw.startswith("||"):
         d = raw[2:]
         d = re.split(r"[\^/$]", d, 1)[0]
         return normalize_domain(d)
 
-    # dnsmasq: address=/domain.com/0.0.0.0
+    # dnsmasq:
+    # address=/domain.com/0.0.0.0
+    # server=/domain.com/
     m = re.match(r"^(?:address|server)=/([^/]+)/", raw)
     if m:
         return normalize_domain(m.group(1))
 
-    # smartdns: address /domain.com/#
+    # smartdns:
+    # address /domain.com/#
     m = re.match(r"^address\s+/([^/]+)/", raw)
     if m:
         return normalize_domain(m.group(1))
 
+    # plain domain / wildcard:
+    # example.com
+    # *.example.com
     token = re.split(r"[\s,\t]", raw, 1)[0]
-    token = token.split("^", 1)[0].split("$", 1)[0].strip()
+    token = token.split("^", 1)[0]
+    token = token.split("$", 1)[0]
+    token = token.strip()
+
     return normalize_domain(token)
 
 def is_allowlisted(domain):
@@ -121,14 +135,14 @@ def is_allowlisted(domain):
 def download_one(url):
     name = os.path.basename(urlparse(url).path) or urlparse(url).netloc
     ctx = ssl.create_default_context()
-
     last_error = None
+
     for attempt in range(1, RETRIES + 1):
         try:
             req = urllib.request.Request(
                 url,
                 headers={
-                    "User-Agent": "smartdns-blocklist-generator/3.0",
+                    "User-Agent": "smartdns-blocklist-generator/3.1",
                     "Accept-Encoding": "gzip",
                     "Connection": "close",
                 },
@@ -139,6 +153,7 @@ def download_one(url):
                     data = gzip.decompress(data)
                 text = data.decode("utf-8", errors="ignore")
                 return name, url, text, None
+
         except Exception as e:
             last_error = e
             time.sleep(1)
@@ -147,32 +162,43 @@ def download_one(url):
 
 def parse_content(text):
     domains = set()
+
     for line in text.splitlines():
         d = extract_from_line(line)
         if d and not is_allowlisted(d):
             domains.add(d)
+
     return domains
 
 def wildcard_covers_exact(wildcard, exact):
-    return wildcard.startswith("*.") and exact.endswith("." + wildcard[2:])
+    if not wildcard.startswith("*."):
+        return False
+
+    base = wildcard[2:]
+    return exact.endswith("." + base)
 
 def wildcard_covers_wildcard(parent, child):
-    return (
-        parent.startswith("*.")
-        and child.startswith("*.")
-        and child[2:].endswith("." + parent[2:])
-    )
+    if not parent.startswith("*.") or not child.startswith("*."):
+        return False
+
+    parent_base = parent[2:]
+    child_base = child[2:]
+
+    return child_base.endswith("." + parent_base)
 
 def optimize(domains):
     wildcards = sorted(d for d in domains if d.startswith("*."))
     exacts = sorted(d for d in domains if not d.startswith("*."))
 
+    # Giữ wildcard cấp cao nếu upstream đã có sẵn.
+    # Không tự tạo wildcard mới.
     kept_wildcards = []
     for w in sorted(wildcards, key=lambda x: (x.count("."), x)):
         if any(wildcard_covers_wildcard(parent, w) for parent in kept_wildcards):
             continue
         kept_wildcards.append(w)
 
+    # Bỏ exact nếu đã bị wildcard upstream bao phủ.
     kept_exacts = []
     for d in exacts:
         if any(wildcard_covers_exact(w, d) for w in kept_wildcards):
@@ -180,6 +206,27 @@ def optimize(domains):
         kept_exacts.append(d)
 
     return kept_wildcards, kept_exacts
+
+def write_output(wildcards, exacts, raw_count, duration):
+    final_count = len(wildcards) + len(exacts)
+
+    with open(OUTPUT_FILE, "w", encoding="utf-8", newline="\n") as f:
+        f.write("# SmartDNS optimized blocklist\n")
+        f.write(f"# Generated: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n")
+        f.write("# Format: domain-set file, one domain per line\n")
+        f.write("# Rule: keep upstream wildcard/suffix only, do not synthesize new suffix\n")
+        f.write(f"# Raw unique: {raw_count:,}\n")
+        f.write(f"# Final: {final_count:,}\n")
+        f.write(f"# Wildcards: {len(wildcards):,}\n")
+        f.write(f"# Exact: {len(exacts):,}\n")
+        f.write(f"# Duration: {duration:.1f}s\n")
+        f.write("#" + "=" * 60 + "\n\n")
+
+        for d in wildcards:
+            f.write(d + "\n")
+
+        for d in exacts:
+            f.write(d + "\n")
 
 def main():
     start = time.time()
@@ -207,27 +254,25 @@ def main():
 
             wc = sum(1 for d in domains if d.startswith("*."))
             ex = len(domains) - wc
-            log(f"OK   {name}: parsed={len(domains):,}, wildcard={wc:,}, exact={ex:,}, new={added:,}")
+
+            log(
+                f"OK   {name}: "
+                f"parsed={len(domains):,}, "
+                f"wildcard={wc:,}, "
+                f"exact={ex:,}, "
+                f"new={added:,}"
+            )
 
     raw_count = len(all_domains)
+
+    log("")
+    log("Optimizing...")
     wildcards, exacts = optimize(all_domains)
+
+    duration = time.time() - start
+    write_output(wildcards, exacts, raw_count, duration)
+
     final_count = len(wildcards) + len(exacts)
-
-    with open(OUTPUT_FILE, "w", encoding="utf-8", newline="\n") as f:
-        f.write("# SmartDNS optimized blocklist\n")
-        f.write(f"# Generated: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n")
-        f.write("# Format: domain-set file, one domain per line\n")
-        f.write("# Rule: keep upstream wildcard/suffix only, do not synthesize new suffix\n")
-        f.write(f"# Raw unique: {raw_count:,}\n")
-        f.write(f"# Final: {final_count:,}\n")
-        f.write(f"# Wildcards: {len(wildcards):,}\n")
-        f.write(f"# Exact: {len(exacts):,}\n")
-        f.write("#" + "=" * 60 + "\n\n")
-
-        for d in wildcards:
-            f.write(d + "\n")
-        for d in exacts:
-            f.write(d + "\n")
 
     log("")
     log("=== Final Statistics ===")
@@ -238,7 +283,7 @@ def main():
     log(f"Exact      : {len(exacts):,}")
     log(f"File       : {OUTPUT_FILE}")
     log(f"Size       : {os.path.getsize(OUTPUT_FILE) / 1024:.1f} KiB")
-    log(f"Duration   : {time.time() - start:.1f}s")
+    log(f"Duration   : {duration:.1f}s")
 
 if __name__ == "__main__":
     main()
