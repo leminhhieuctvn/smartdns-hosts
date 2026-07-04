@@ -10,6 +10,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 from functools import lru_cache
+from collections import defaultdict
 
 SOURCES = [
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt",
@@ -24,9 +25,9 @@ SOURCES = [
 ]
 
 OUTPUT_FILE = "adblock_merged.txt"
-MAX_WORKERS = 16  # Tăng workers vì phần lớn thời gian là I/O
-TIMEOUT = 15  # Giảm timeout
-RETRIES = 1  # Giảm retries
+MAX_WORKERS = 8  # Giảm xuống để tránh rate limiting
+TIMEOUT = 30  # Tăng timeout
+RETRIES = 3  # Tăng retries
 
 ALLOWLIST = {
     "imoulife.com", "lechange.com", "easy4ip.com", 
@@ -34,33 +35,14 @@ ALLOWLIST = {
     "cloudflare-dns.com", "dns.google",
 }
 
-# Pre-compile patterns và tối ưu regex
 DOMAIN_RE = re.compile(
     r"^(?:\*\.)?(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
 )
-
-# Cache cho allowlist checking
-@lru_cache(maxsize=10000)
-def is_allowlisted_cached(domain):
-    base = domain[2:] if domain.startswith("*.") else domain
-    
-    # Tối ưu: kiểm tra trực tiếp trước
-    if domain in ALLOWLIST or base in ALLOWLIST:
-        return True
-    
-    for allow in ALLOWLIST:
-        if allow.startswith("*."):
-            allow_base = allow[2:]
-            if base == allow_base or base.endswith("." + allow_base):
-                return True
-    
-    return False
 
 def log(msg):
     print(msg, flush=True)
 
 def is_ip(s):
-    # Tối ưu: kiểm tra nhanh hơn
     try:
         ipaddress.ip_address(s)
         return True
@@ -68,12 +50,10 @@ def is_ip(s):
         return False
 
 def normalize_domain(d):
-    # Tối ưu: xử lý nhanh hơn với string operations
     d = d.strip().lower()
     if not d:
         return None
     
-    # Remove trailing dot và carriage return
     if d.endswith('.'):
         d = d[:-1]
     d = d.replace('\r', '').replace('\n', '')
@@ -84,21 +64,17 @@ def normalize_domain(d):
     if d.startswith("."):
         d = "*" + d
 
-    # Fix double wildcard pattern
     if "*.*." in d:
         d = d.replace("*.*.", "*.", 1)
 
-    # Tối ưu: kiểm tra pattern sớm
     if d.startswith("*."):
         base = d[2:]
-        # Fast check cho IP
         if ':' in base or (base.replace('.', '').isdigit() and base.count('.') == 3):
             return None
         if not DOMAIN_RE.match(d):
             return None
         return d
 
-    # Nếu có * hoặc là IP, bỏ qua
     if '*' in d:
         return None
     
@@ -115,7 +91,6 @@ def extract_from_line(line):
     if not raw or raw[0] in ('#', '!', '/', ';', '['):
         return None
 
-    # Tối ưu: xử lý comment nhanh hơn
     comment_pos = raw.find('#')
     if comment_pos == -1:
         comment_pos = len(raw)
@@ -128,7 +103,6 @@ def extract_from_line(line):
         if not raw:
             return None
 
-    # Tối ưu: Kiểm tra các format phổ biến
     if raw.startswith("||"):
         d = raw[2:]
         end = d.find('^')
@@ -142,29 +116,24 @@ def extract_from_line(line):
             end = end3
         return normalize_domain(d[:end])
 
-    # Hosts format
     parts = raw.split(None, 2)
     if len(parts) >= 2:
         first = parts[0]
-        # Check if first part is IP
         if first.count('.') == 3 and all(p.isdigit() for p in first.split('.')):
             return normalize_domain(parts[1])
         if first == '127.0.0.1':
             return normalize_domain(parts[1])
 
-    # dnsmasq format
     if raw.startswith('address=/') or raw.startswith('server=/'):
         m = re.match(r"^(?:address|server)=/([^/]+)/", raw)
         if m:
             return normalize_domain(m.group(1))
 
-    # smartdns format
     if raw.startswith('address /'):
         m = re.match(r"^address\s+/([^/]+)/", raw)
         if m:
             return normalize_domain(m.group(1))
 
-    # Plain domain - chỉ lấy token đầu tiên
     space_pos = raw.find(' ')
     if space_pos != -1:
         raw = raw[:space_pos]
@@ -173,7 +142,6 @@ def extract_from_line(line):
     if tab_pos != -1:
         raw = raw[:tab_pos]
     
-    # Remove AdGuard modifiers
     raw = raw.rstrip('^$')
     
     return normalize_domain(raw)
@@ -182,15 +150,16 @@ def download_one(url):
     name = os.path.basename(urlparse(url).path) or urlparse(url).netloc
     ctx = ssl.create_default_context()
     
+    log(f"  Downloading {name}...")
+    
     for attempt in range(RETRIES + 1):
         try:
             req = urllib.request.Request(
                 url,
                 headers={
-                    "User-Agent": "smartdns-blocklist-generator/3.1",
+                    "User-Agent": "Mozilla/5.0 (compatible; smartdns-blocklist-generator/3.1)",
                     "Accept-Encoding": "gzip",
                     "Connection": "close",
-                    "Cache-Control": "no-cache",
                 },
             )
             with urllib.request.urlopen(req, timeout=TIMEOUT, context=ctx) as r:
@@ -198,19 +167,36 @@ def download_one(url):
                 if r.headers.get("Content-Encoding") == "gzip":
                     data = gzip.decompress(data)
                 text = data.decode("utf-8", errors="ignore")
+                log(f"  ✓ {name}: {len(text):,} bytes")
                 return name, url, text, None
 
         except Exception as e:
-            if attempt == RETRIES:
+            log(f"  ✗ {name} attempt {attempt+1}: {str(e)[:100]}")
+            if attempt < RETRIES:
+                time.sleep(2)
+            else:
                 return name, url, "", str(e)
-            time.sleep(0.5)  # Giảm delay
 
     return name, url, "", "Max retries exceeded"
+
+@lru_cache(maxsize=10000)
+def is_allowlisted_cached(domain):
+    base = domain[2:] if domain.startswith("*.") else domain
+    
+    if domain in ALLOWLIST or base in ALLOWLIST:
+        return True
+    
+    for allow in ALLOWLIST:
+        if allow.startswith("*."):
+            allow_base = allow[2:]
+            if base == allow_base or base.endswith("." + allow_base):
+                return True
+    
+    return False
 
 def parse_content(text):
     domains = set()
     
-    # Tối ưu: xử lý từng dòng một cách hiệu quả
     for line in text.splitlines():
         d = extract_from_line(line)
         if d and not is_allowlisted_cached(d):
@@ -218,48 +204,125 @@ def parse_content(text):
     
     return domains
 
-def optimize(domains):
-    # Phân loại nhanh
+class DomainTrie:
+    """Trie để lưu trữ và tối ưu domains"""
+    def __init__(self):
+        self.children = {}
+        self.is_wildcard = False
+        self.has_wildcard_child = False
+    
+    def insert_reversed(self, domain_parts, is_wildcard=False):
+        """Chèn domain với các phần đảo ngược (com -> example -> *)"""
+        node = self
+        for part in reversed(domain_parts):
+            if part not in node.children:
+                node.children[part] = DomainTrie()
+            node = node.children[part]
+        if is_wildcard:
+            node.is_wildcard = True
+    
+    def mark_wildcard_path(self):
+        """Đánh dấu các node có wildcard trong cây con"""
+        if self.is_wildcard:
+            self.has_wildcard_child = True
+        
+        for child in self.children.values():
+            child.mark_wildcard_path()
+            if child.has_wildcard_child:
+                self.has_wildcard_child = True
+    
+    def collect_minimal_wildcards(self, current_path=None):
+        """Thu thập các wildcard tối thiểu"""
+        if current_path is None:
+            current_path = []
+        
+        wildcards = []
+        
+        if self.is_wildcard:
+            if not any(node.is_wildcard for node in self._get_path_nodes(current_path)):
+                wildcards.append(".".join(reversed(current_path)))
+        
+        for part, child in self.children.items():
+            if child.has_wildcard_child:
+                wildcards.extend(child.collect_minimal_wildcards(current_path + [part]))
+        
+        return wildcards
+    
+    def _get_path_nodes(self, path):
+        """Lấy tất cả nodes trên đường dẫn"""
+        nodes = []
+        node = self
+        for part in reversed(path):
+            if part in node.children:
+                node = node.children[part]
+                nodes.append(node)
+        return nodes
+    
+    def is_covered_by_wildcard(self, domain_parts):
+        """Kiểm tra domain có bị wildcard nào bao phủ không"""
+        node = self
+        for part in reversed(domain_parts):
+            if node.is_wildcard:
+                return True
+            if part not in node.children:
+                return False
+            node = node.children[part]
+        return node.is_wildcard
+
+def optimize_trie(domains):
+    """Tối ưu hóa sử dụng Trie - O(N)"""
+    log("  Phân loại domains...")
+    
     wildcards = []
     exacts = []
     
     for d in domains:
         if d.startswith("*."):
-            wildcards.append(d)
+            wildcards.append(d[2:])  # Bỏ "*."
         else:
             exacts.append(d)
     
-    # Sắp xếp wildcards theo độ dài (ngắn nhất trước = domain cha)
-    wildcards.sort(key=lambda x: (x.count("."), len(x)))
+    log(f"  Wildcards: {len(wildcards):,}, Exacts: {len(exacts):,}")
     
-    # Loại bỏ wildcards bị bao phủ
-    kept_wildcards = []
-    wildcard_bases = set()
-    
+    # Xây dựng Trie cho wildcards
+    log("  Xây dựng Trie cho wildcards...")
+    trie = DomainTrie()
     for w in wildcards:
-        base = w[2:]  # Bỏ "*."
-        if not any(base.endswith("." + parent_base) for parent_base in wildcard_bases):
-            kept_wildcards.append(w)
-            wildcard_bases.add(base)
+        parts = w.split(".")
+        trie.insert_reversed(parts, is_wildcard=True)
+    
+    # Đánh dấu các wildcard paths
+    log("  Tối ưu wildcards...")
+    trie.mark_wildcard_path()
+    
+    # Lấy wildcards tối thiểu
+    minimal_wildcards = trie.collect_minimal_wildcards()
+    log(f"  Giữ lại {len(minimal_wildcards):,} wildcards (loại bỏ {len(wildcards) - len(minimal_wildcards):,})")
     
     # Kiểm tra exact domains bị wildcards bao phủ
+    log("  Kiểm tra exact domains...")
     kept_exacts = []
-    for d in exacts:
-        # Kiểm tra nhanh xem có bị wildcard nào bao phủ không
-        covered = False
-        for w_base in wildcard_bases:
-            if d.endswith("." + w_base):
-                covered = True
-                break
-        if not covered:
-            kept_exacts.append(d)
+    removed_exacts = 0
     
-    return kept_wildcards, kept_exacts
+    for i, d in enumerate(exacts):
+        if i % 100000 == 0:
+            log(f"    Processing exact domain {i:,}/{len(exacts):,}...")
+        parts = d.split(".")
+        if not trie.is_covered_by_wildcard(parts):
+            kept_exacts.append(d)
+        else:
+            removed_exacts += 1
+    
+    log(f"  Giữ lại {len(kept_exacts):,} exact domains (loại bỏ {removed_exacts:,})")
+    
+    # Format lại wildcards
+    formatted_wildcards = ["*." + w for w in minimal_wildcards]
+    
+    return sorted(formatted_wildcards), sorted(kept_exacts)
 
 def write_output(wildcards, exacts, raw_count, duration):
     final_count = len(wildcards) + len(exacts)
     
-    # Tối ưu: ghi file nhanh hơn với join
     with open(OUTPUT_FILE, "w", encoding="utf-8", newline="\n") as f:
         lines = [
             "# SmartDNS optimized blocklist",
@@ -276,7 +339,6 @@ def write_output(wildcards, exacts, raw_count, duration):
         ]
         f.write("\n".join(lines))
         
-        # Ghi domains
         if wildcards:
             f.write("\n".join(wildcards) + "\n")
         if exacts:
@@ -292,14 +354,22 @@ def main():
     log("")
 
     # Download và parse song song
+    log("Downloading sources...")
+    log("=" * 60)
+    
+    completed = 0
+    failed = 0
+    
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(download_one, url): url for url in SOURCES}
 
         for future in as_completed(futures):
             name, url, text, error = future.result()
+            completed += 1
 
             if error:
-                log(f"FAIL {name}: {error}")
+                failed += 1
+                log(f"\nFAIL [{completed}/{len(SOURCES)}] {name}: {error}")
                 continue
 
             domains = parse_content(text)
@@ -311,24 +381,32 @@ def main():
             ex = len(domains) - wc
 
             log(
-                f"OK   {name}: "
+                f"OK   [{completed}/{len(SOURCES)}] {name}: "
                 f"parsed={len(domains):,}, "
                 f"wildcard={wc:,}, "
                 f"exact={ex:,}, "
                 f"new={added:,}"
             )
 
+    log("=" * 60)
+    log(f"Completed: {completed}/{len(SOURCES)}, Failed: {failed}/{len(SOURCES)}")
+    
+    if failed > 0:
+        log("WARNING: Some sources failed to download!")
+    
     raw_count = len(all_domains)
 
     log("")
     log("Optimizing...")
-    wildcards, exacts = optimize(all_domains)
+    log("=" * 60)
+    wildcards, exacts = optimize_trie(all_domains)
 
     duration = time.time() - start
     write_output(wildcards, exacts, raw_count, duration)
 
     final_count = len(wildcards) + len(exacts)
 
+    log("=" * 60)
     log("")
     log("=== Final Statistics ===")
     log(f"Raw unique : {raw_count:,}")
