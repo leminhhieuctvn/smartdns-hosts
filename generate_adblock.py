@@ -39,7 +39,7 @@ RETRIES = 3
 ALLOWLIST = {
     "imoulife.com", "lechange.com", "easy4ip.com", 
     "dahuasecurity.com", "tailscale.com",
-    "cloudflare-dns.com", "dns.google",
+    "cloudflare-dns.com", "dns.google","ellekit.space",
 }
 
 DOMAIN_RE = re.compile(
