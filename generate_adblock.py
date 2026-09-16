@@ -34,11 +34,8 @@ DEFAULT_SOURCES = (
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/popupads-onlydomains.txt",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/tif.medium-onlydomains.txt",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/doh-vpn-proxy-bypass-onlydomains.txt",
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/dyndns-onlydomains.txt",
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/gambling-onlydomains.txt",
-    "https://big.oisd.nl/domainswild",
-    "https://raw.githubusercontent.com/badmojr/1Hosts/master/Lite/wildcards.txt",
-)
+    )
 
 DEFAULT_ALLOWLIST = (
     "imoulife.com",
