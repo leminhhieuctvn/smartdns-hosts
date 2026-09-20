@@ -47,6 +47,7 @@ DEFAULT_ALLOWLIST = (
     "dns.google",
     "ellekit.space",
     "amazonaws.com",
+    "rethinkdns.com",
 )
 
 LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
