@@ -38,6 +38,7 @@ DEFAULT_SOURCES = (
     )
 
 DEFAULT_ALLOWLIST = (
+    # Infrastructure & Custom services
     "imoulife.com",
     "lechange.com",
     "easy4ip.com",
@@ -48,6 +49,15 @@ DEFAULT_ALLOWLIST = (
     "ellekit.space",
     "amazonaws.com",
     "rethinkdns.com",
+    
+    # iOS Wi-Fi Stability & Connectivity Checks (Excludes ocsp.apple.com to keep anti-revoke working)
+    "captive.apple.com",
+    "push.apple.com",
+    "time.apple.com",
+    "time-ios.apple.com",
+    "mesu.apple.com",
+    "appldnld.apple.com",
+    "swscan.apple.com",
 )
 
 LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -347,8 +357,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         output_path = Path(args.output).resolve()
         meta_path = Path(args.meta).resolve() if args.meta else Path(str(output_path) + ".meta")
         atomic_write(output_path, output_text)
-        # Keep the same simple sidecar style as the original generator so a
-        # GitHub Actions workflow can publish both files directly.
         meta_lines = [
             "# SmartDNS Blocklist metadata",
             f"# Generated: {metadata['generated_utc']}",
